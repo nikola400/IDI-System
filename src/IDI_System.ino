@@ -1,46 +1,76 @@
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <LiquidCrystal_PCF8574.h>
 #include "config.h"
 
-#define SEALEVELPRESSURE_HPA (1013.25)
+// SPI Comunication Pins
+#define BME_SCK 14
+#define BME_MISO 12
+#define BME_MOSI 13
+#define BME_CS 15
 
 // LED Lights Pins
-const int LED_PIN_GREEN = 22;
-const int LED_PIN_RED = 23;
-const int LED_PIN_YELLOW = 21;
+#define LED_PIN_GREEN 22
+#define LED_PIN_RED 23
+#define LED_PIN_YELLOW 21
+
+// Water Valve Pin
+#define VALVE_PIN 35
+
+// Soil Moisture Pin
+#define SOIL_MOISTURE_ANALOG_PIN 36
+
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+// Constants
+const int MORNING_WATERING_START = 6;
+const int MORNING_WATERING_END = 8;
+const int EVENING_WATERING_START = 19;
+const int EVENING_WATERING_END = 22;
+
+// REST APIs URLs
+const char* weatherApi= ""; // still searching
+const char* timeApi = "http://worldtimeapi.org/api/timezone/Europe/Sofia";
 
 // WiFi configurations and variables
 //const char* ssid = NETWORK_SECRET_SSID;
 //const char* password = NETWORK_SECRET_PASS;
 const char* ssid = "A1_C5B4";
 const char* password = "48575443B036A4A4";
-//WiFiServer server(80);
 
-//I2C Pins 
-const int PIN_SDA = 7;
-//// BME 280 Sensor for temperature and pressure
-const int PIN_SCL = 6;
-Adafruit_BME280 bme; // I2C
+// Soil Moisture Sensor
+const int AIR_VALUE = 3620;
+const int WATER_VALUE = 1680;
+const int TOMATO_SOIL_MOISTURE_MIN = 70;
+const int TOMATO_SOIL_MOISTURE_MAX = 90;
 
-// LCD Liquid Crystal Display
-LiquidCrystal_PCF8574 lcd(0x27);
+// Global variables
+int soilMoistureValue = 0;
+int soilmoisturePercent = 0;
+
+// Plant config
+String plantName = "tomato";
+int plantSoilMoistureMin = 70;
+int plantSoilMoistureMax = 90;
 
 // Web Server
 WebServer server(80);
 
-// Soil Moisture Sensor
-const int AirValue = 3620;
-const int WaterValue = 1680;
-const int TOMATO_SOIL_MOISTURE_MIN = 70;
-const int LED_ANALOG_SOIL_MOISTURE_PIN = 36;
-int soilMoistureValue = 0;
-int soilmoisturePercent = 0;
+// HTTP Clien
+HTTPClient http;
 
-const long sleepTime = 3600000; //1 hour dalay time
+// JSON Parser
+StaticJsonBuffer<200> jsonBuffer;
+
+// BME Connected via SPI Protocol
+Adafruit_BME280 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK);
 
 void setup() {
   // put your setup code here, to run once:
@@ -50,6 +80,7 @@ void setup() {
   //Set pins mode
   pinMode(LED_PIN_RED, OUTPUT);
   pinMode(LED_PIN_GREEN, OUTPUT);
+  pinMode(LED_PIN_YELLOW, OUTPUT);
 
   // power on lights to show esp32 is working
   lightsOn();
@@ -61,35 +92,35 @@ void setup() {
   } else {
     Serial.println("Cannot connect to WiFi successfully!");
   }
-
-  createWebServer();
-
-  connectBME280();
-
-  lcd.begin(PIN_SCL, PIN_SDA);
   
+  createWebServer();
+  connectBME();
 }
 
 void loop() {
   // Print metrisc from BME 280
-  printToLCD();
-  printToSerial();
-  printSoilMoisturePercentToSerial();
 
+  // uncoment for debug
+//  Serial.println("Esp in loop func");
+//  delay(1000); 
+//  printToSerial();
+//  printSoilMoisturePercentToSerial();
+
+  
   server.handleClient();
-
-  sendSignalValve();
+  checkForWatering();
 }
 
-void printSoilMoisturePercentToSerial() {
-  Serial.print("Soil Moisture Percent: ");
-  Serial.print(getSoilMoisturePercent());
-  Serial.println("%");
-}
+//void printSoilMoisturePercentToSerial() {
+//  Serial.print("Soil Moisture Percent: ");
+//  Serial.print(getSoilMoisturePercent());
+//  Serial.println("%");
+//}
 
 int getSoilMoisturePercent() {
-  int soilMoistureValue = analogRead(LED_ANALOG_SOIL_MOISTURE_PIN);
-  int soilMoisturePercent = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+  return 80;
+  int soilMoistureValue = analogRead(SOIL_MOISTURE_ANALOG_PIN);
+  int soilMoisturePercent = map(soilMoistureValue, AIR_VALUE, WATER_VALUE, 0, 100);
 
   if (soilMoisturePercent > 100) {
     return 100;
@@ -103,6 +134,7 @@ int getSoilMoisturePercent() {
 }
 
 void lightsOn() {
+  digitalWrite(LED_PIN_YELLOW, LOW);
   digitalWrite(LED_PIN_RED, HIGH);
   delay(500);
   digitalWrite(LED_PIN_RED, LOW);
@@ -201,59 +233,31 @@ boolean scanNetworks() {
   return foundNetwork;
 }
 
-void connectBME280() {
-  unsigned status;
-    
-  Wire.begin(PIN_SCL, PIN_SDA);
-  
-  // default settings
-  status = bme.begin(0x76);  
-  // You can also pass in a Wire library object like &Wire2
-  // status = bme.begin(0x76, &Wire2)
+void connectBME() {
+  bool status;
+  status = bme.begin();  
   if (!status) {
-      Serial.println("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
-      Serial.print("SensorID was: 0x"); Serial.println(bme.sensorID(),16);
-      Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
-      Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
-      Serial.print("        ID of 0x60 represents a BME 280.\n");
-      Serial.print("        ID of 0x61 represents a BME 680.\n");
-      while (1) delay(10);
+      Serial.println("Could not find a valid BME280 sensor, check wiring!");
+      while (1);
   } else {
-    Serial.println("BME 280 found Successfully");
+    Serial.println("Connect to BME280 sensor successfully.");
   }
-}
-
-void printToLCD() {
-  Serial.println("Printing Temprerature and Pressure from BME280 to LCD Liquid Crystal display!");
-  
-  lcd.setBacklight(50);
-  lcd.home();
-  lcd.clear();
-  //first line
-  lcd.setCursor(0,0);
-  lcd.print("Temp: ");
-  lcd.print(bme.readTemperature());
-  lcd.print("C");
-  //second line
-  lcd.setCursor(0,1);
-  lcd.print("Pres: ");
-  lcd.println(bme.readPressure() / 100.0F);
-  lcd.print("hPa");
+  // some time for BME280 to boot up
+  delay(1000);
 }
 
 void printToSerial() {
   Serial.print("Temperature = ");
   Serial.print(bme.readTemperature());
-  Serial.println(" *C");
+  Serial.println(" *C"); 
 
   Serial.print("Pressure = ");
-
   Serial.print(bme.readPressure() / 100.0F);
   Serial.println(" hPa");
 
   Serial.print("Approx. Altitude = ");
   Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
-  Serial.println(" m");
+  Serial.println(" m");  
 
   Serial.print("Humidity = ");
   Serial.print(bme.readHumidity());
@@ -270,16 +274,27 @@ void createWebServer() {
   server.on("/", handleRoot);
 
   server.on("/test", []() {
+    Serial.println("[Web Server]: handle GET /test request");
+    Serial.println();
+  
+    digitalWrite(LED_PIN_YELLOW, HIGH);
     server.send(200, "text/plain", "Web Server works well");
+    digitalWrite(LED_PIN_YELLOW, LOW);
   });
 
   server.on("/temp", returnTemp);
 
   server.on("/hum", returnHum);
 
+  server.on("/alt", returnAlt);
+
   server.on("/soilMoisture", returnSoilMoisture);
 
-  server.on("/addPlant", addPlant);
+  server.on("/metrics", returnMetrics);
+
+  server.on("/plant", returnPlant);
+
+  server.on("/setPlant", setPlant);
 
   server.onNotFound(handleNotFound);
 
@@ -288,46 +303,151 @@ void createWebServer() {
 }
 
 void handleRoot() {
+  Serial.println("[Web Server]: handle GET / request");
+  Serial.println();
+  
   digitalWrite(LED_PIN_YELLOW, HIGH);
   String response = "This is IDI System Web Server!\n";
+  response += "From here you can check all metrics of the system.";
+  response += "You can also add new plants to the system.";
   response += "You can call these endpoints: \n";
-  response += "/temp  -get air temperature \n";
-  response += "/hum  -get air humidity \n";
-  response += "/soilMoisture  -get soilMoisture \n";
-  response += "/addPlant  -add new plant for monitoring \n\n";
+  response += "GET /temp  - get air temperature \n";
+  response += "GET /hum  - get air humidity \n";
+  response += "GET /alt  - get approx. altitude \n";
+  response += "GET /soilMoisture  - get soilMoisture \n";
+  response += "GET /metrics  - get metrics from all sensors \n";
+  response += "GET /plant  - get plant configuration of the system \n";
+  response += "POST /setPlant - upsert plant configuration of the system \n";
+//  response += "/addPlant  - add new plant for monitoring \n\n";
 
-  
   server.send(200, "text/plain", response);
   digitalWrite(LED_PIN_YELLOW, LOW);
 }
 
 void returnTemp() {
+  Serial.println("[Web Server]: handle GET Air Temperature request");
+  Serial.println();
+  
   digitalWrite(LED_PIN_YELLOW, HIGH);
   String response = "Air Temperature: ";
   response += bme.readTemperature();
-  response += "C";
+  response += " *C";
 
   server.send(200, "text/plain", response);
   digitalWrite(LED_PIN_YELLOW, LOW);
 }
 
 void returnHum() {
+  Serial.println("[Web Server]: handle GET Air Humidity request");
+  Serial.println();
+  
   digitalWrite(LED_PIN_YELLOW, HIGH);
   String response = "Air Humidity: ";
   response += bme.readHumidity();
-  response += "%";
+  response += " %";
+
+  server.send(200, "text/plain", response);
+  digitalWrite(LED_PIN_YELLOW, LOW);
+}
+
+void returnAlt() {
+  Serial.println("[Web Server]: handle GET Approx. Altitude request");
+  Serial.println();
+  
+  digitalWrite(LED_PIN_YELLOW, HIGH);
+  String response = "Approx. Altitude = ";
+  response += bme.readAltitude(SEALEVELPRESSURE_HPA);
+  response += " m";
 
   server.send(200, "text/plain", response);
   digitalWrite(LED_PIN_YELLOW, LOW);
 }
 
 void returnSoilMoisture() {
+  Serial.println("[Web Server]: handle GET Soil Moisture request");
+  Serial.println();
+  
   digitalWrite(LED_PIN_YELLOW, HIGH);
   String response = "Soil Moisture: ";
-  response += getSoilMoisturePercent();
-  response += "%";
-  
+//  response += getSoilMoisturePercent();
+  response += " %";
+
   server.send(200, "text/plain", response);
+  digitalWrite(LED_PIN_YELLOW, LOW);
+}
+
+void returnMetrics() {
+  Serial.println("[Web Server]: handle GET /metrics request");
+  Serial.println();
+  
+  digitalWrite(LED_PIN_YELLOW, HIGH);
+  String response = "Air Temperature: ";
+  response += bme.readTemperature();
+  response += " *C\n";
+
+  response += "Air Humidity: ";
+  response += bme.readHumidity();
+  response += " %\n";
+
+  response += "Approx. Altitude = ";
+  response += bme.readAltitude(SEALEVELPRESSURE_HPA);
+  response += " m\n";
+
+  response += "Pressure = ";
+  response += bme.readPressure() / 100.0F;
+  response += " hPa\n";
+
+  response += "Soil Moisture: ";
+//  response += getSoilMoisturePercent();
+  response += " %\n\n";
+
+  server.send(200, "text/plain", response);
+  digitalWrite(LED_PIN_YELLOW, LOW);
+}
+
+void returnPlant() {
+  Serial.println("[Web Server]: handle GET /plant request");
+  Serial.println();
+  
+  digitalWrite(LED_PIN_YELLOW, HIGH);
+  String response = jsonPlant();
+
+  server.send(200, "text/json", response);
+  digitalWrite(LED_PIN_YELLOW, LOW);
+}
+
+// TODO: plant should be updated every time
+void setPlant() {
+  Serial.println("[Web Server]: handle POST /plant request");
+  Serial.println();
+  
+  digitalWrite(LED_PIN_YELLOW, HIGH);
+  String bodyRequest = server.arg(0);
+  JsonObject& parsed = jsonBuffer.parseObject(bodyRequest); //Parse message
+  String newPlantName = parsed["plantName"];
+  int newMin = parsed["minPlantSoilMoisture"];
+  int newMax = parsed["maxPlantSoilMoisture"];
+  jsonBuffer.clear(); // clear buffer so it can be used again later
+  
+  plantSoilMoistureMin = newMin;
+  plantSoilMoistureMax = newMax;
+  
+  if (newPlantName.equals(plantName)) {
+    Serial.print("[Web Server]: Plant ");
+    Serial.print(plantName);
+    Serial.println(" was updated successfully!");
+
+    server.send(200, "text/json", jsonPlant());
+  } else {
+    String oldName = plantName;
+    plantName = newPlantName;
+    Serial.print("[Web Server]: Plant ");
+    Serial.print(oldName);
+    Serial.print(" was changed successfully to ");
+    Serial.println(plantName);
+
+    server.send(200, "text/json", jsonPlant());
+  }
   digitalWrite(LED_PIN_YELLOW, LOW);
 }
 
@@ -339,6 +459,9 @@ void addPlant() {
 }
 
 void handleNotFound() {
+  Serial.println("[Web Server]: handle not found..");
+  Serial.println();
+  
   digitalWrite(LED_PIN_YELLOW, HIGH);
   String response = "Bad request\n\n";
   response += "To view available ednpoints call /";
@@ -347,20 +470,88 @@ void handleNotFound() {
   digitalWrite(LED_PIN_YELLOW, LOW);
 }
 
-boolean checkForWatering() {
-  //TODO: check time (do not water in the middle of the day)
+String doGetRequest(const char* apiUrl) {
+  http.begin(apiUrl);
+  
+  Serial.print("[HTTP]: Get Request to: ");
+  Serial.println(apiUrl);
 
-  int currentSoilMoisture = getSoilMoisturePercent();
-  if (currentSoilMoisture < TOMATO_SOIL_MOISTURE_MIN) {
-    return true;
+  int httpResponseCode = http.GET();
+  if (httpResponseCode == 200) {
+    return http.getString();
+  } else {
+    Serial.print("Error sending the Get Request to ");
+    Serial.println(apiUrl);
+    Serial.println(httpResponseCode);
+    Serial.println();
+
+    return "";
   }
-
-  return false;
+  http.end();
 }
 
-void sendSignalValve() {
-  //TODO send signal to the valve if watering is needed
-  if (checkForWatering()) {
-    // send signal
+String jsonPlant() { 
+  String json = "{";
+  json += "\"plantName\": \"" + plantName + "\",";
+  json += "\"minPlantSoilMoisture\": " + String(plantSoilMoistureMin) + ",";
+  json += "\"maxPlantSoilMoisture\": " + String(plantSoilMoistureMax);
+  json += "}";
+
+  return json;
+}
+
+void checkForWatering() {
+  int currentHour = getCurrentHour();
+  Serial.print("Current hour is: ");
+  Serial.println(currentHour);
+  
+  // if in irrigation hours - irrigate
+  Serial.println("Check time..."); 
+  boolean isMorningWateringTime = currentHour > MORNING_WATERING_START && currentHour < MORNING_WATERING_END;
+  boolean isEveningWateringTime = currentHour > EVENING_WATERING_START && currentHour < EVENING_WATERING_END;
+  if (isMorningWateringTime || isEveningWateringTime) {
+    Serial.println("Check Soil Moisture...");
+    irrigate();
+  } else {
+    Serial.println("Now is not an irrigation time");
   }
+}
+
+int getCurrentHour() {
+  String apiResponse = doGetRequest(timeApi);
+  if (apiResponse.equals("")) {
+    // if rest request fails check for watering
+    Serial.println("Error with get request to the weather api");
+    return MORNING_WATERING_START + 1;
+  }
+  
+  String datetimeField = apiResponse.substring(apiResponse.indexOf("\"datetime\""));
+  int hour = datetimeField.substring(23, 25).toInt();
+  return hour;
+}
+
+void irrigate() {
+  int currentSoilMoisture = getSoilMoisturePercent();
+  if (currentSoilMoisture < plantSoilMoistureMin) {
+    Serial.println("Start irrigation proces");
+    ValveOn();
+    
+    while(currentSoilMoisture < plantSoilMoistureMax) {
+      currentSoilMoisture = getSoilMoisturePercent();
+    }
+    
+    ValveOff();
+  }  else {
+    Serial.println("Irrigation not needed");
+  }
+}
+
+void ValveOn() {
+  digitalWrite(VALVE_PIN, HIGH);
+  Serial.println("Valve ON !!!");
+}
+
+void ValveOff() {
+  digitalWrite(VALVE_PIN, LOW);
+  Serial.println("Valve OFF !!!");
 }
